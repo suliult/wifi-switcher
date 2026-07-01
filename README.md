@@ -49,4 +49,4 @@ Windows 本地 Wi-Fi 切换小工具，支持隐藏 Wi-Fi。
 
 ## 许可证
 
-MIT License. See `LICENSE`.
+MIT License. See [LICENSE](LICENSE).
