@@ -46,3 +46,7 @@ Windows 本地 Wi-Fi 切换小工具，支持隐藏 Wi-Fi。
 - 如果连接失败，优先确认 SSID 拼写、密码、安全类型是否正确。
 - 如果提示 Wi-Fi 当前不可用，通常表示这个热点不在范围内，或者隐藏 Wi-Fi 还没有被 Windows 扫描到。
 - 部分公司管控电脑可能禁止普通用户新增 WLAN profile，需要管理员或策略权限。
+
+## 许可证
+
+MIT License. See `LICENSE`.
