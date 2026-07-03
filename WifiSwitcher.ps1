@@ -210,6 +210,96 @@ function Get-AvailableWifiScan {
     }
 }
 
+function Convert-WifiAuthentication {
+    param([string] $Value)
+
+    if ($Value -match "WPA3") {
+        return "WPA3SAE"
+    }
+    if ($Value -match "WPA2") {
+        return "WPA2PSK"
+    }
+    if ($Value -match "WPA") {
+        return "WPAPSK"
+    }
+
+    return ""
+}
+
+function Convert-WifiEncryption {
+    param([string] $Value)
+
+    if ($Value -match "TKIP") {
+        return "TKIP"
+    }
+    if ($Value -match "CCMP|GCMP|AES") {
+        return "AES"
+    }
+
+    return ""
+}
+
+function Get-VisibleWifiSecurityInfo {
+    param([Parameter(Mandatory = $true)][string] $Ssid)
+
+    $result = Invoke-Netsh @("wlan", "show", "networks", "mode=bssid")
+    if ($result.ExitCode -ne 0) {
+        return $null
+    }
+
+    $currentSsid = ""
+    $currentAuthentication = ""
+    $currentEncryption = ""
+
+    function Convert-CurrentSecurity {
+        if ($currentSsid -ne $Ssid -or -not $currentAuthentication -or -not $currentEncryption) {
+            return $null
+        }
+
+        $auth = Convert-WifiAuthentication -Value $currentAuthentication
+        $enc = Convert-WifiEncryption -Value $currentEncryption
+        if (-not $auth -or -not $enc) {
+            return $null
+        }
+
+        return [pscustomobject]@{
+            Ssid           = $Ssid
+            Authentication = $auth
+            Encryption     = $enc
+            SourceAuth     = $currentAuthentication
+            SourceEnc      = $currentEncryption
+        }
+    }
+
+    foreach ($line in ($result.Output -split "`r?`n")) {
+        if ($line -match "^\s*SSID\s+\d+\s*:\s*(.*)\s*$") {
+            $security = Convert-CurrentSecurity
+            if ($security) {
+                return $security
+            }
+
+            $currentSsid = $Matches[1].Trim()
+            $currentAuthentication = ""
+            $currentEncryption = ""
+        }
+        elseif ($currentSsid -eq $Ssid -and $line -match "^\s*(?:Authentication|身份验证)\s*:\s*(.+?)\s*$") {
+            $currentAuthentication = $Matches[1].Trim()
+        }
+        elseif ($currentSsid -eq $Ssid -and $line -match "^\s*(?:Encryption|加密)\s*:\s*(.+?)\s*$") {
+            $currentEncryption = $Matches[1].Trim()
+        }
+
+        if ($currentSsid -eq $Ssid -and $currentAuthentication -and $currentEncryption) {
+            $security = Convert-CurrentSecurity
+            if ($security) {
+                return $security
+            }
+        }
+    }
+
+    return (Convert-CurrentSecurity)
+}
+
 function Get-CurrentConnection {
     try {
         $details = Get-WlanConnectionDetails
@@ -223,6 +313,52 @@ function Get-CurrentConnection {
     }
 
     return "当前状态：未连接"
+}
+
+function Get-WifiDetailsText {
+    param([object] $Profile)
+
+    if ($Profile -and $Profile.Name) {
+        $result = Invoke-Netsh @("wlan", "show", "profiles", "name=$($Profile.Name)", "key=clear")
+        if ($result.ExitCode -ne 0) {
+            throw "无法读取 '$($Profile.Name)' 的保存配置详情。"
+        }
+
+        return $result.Output
+    }
+
+    $result = Invoke-Netsh @("wlan", "show", "interfaces")
+    if ($result.ExitCode -ne 0) {
+        throw "无法读取当前 Wi-Fi 详情。"
+    }
+
+    return $result.Output
+}
+
+function Show-WifiDetailsDialog {
+    param(
+        [string] $Title,
+        [string] $Details
+    )
+
+    $detailsForm = New-Object System.Windows.Forms.Form
+    $detailsForm.Text = $Title
+    $detailsForm.StartPosition = "CenterParent"
+    $detailsForm.Size = New-Object System.Drawing.Size(720, 560)
+    $detailsForm.MinimumSize = New-Object System.Drawing.Size(520, 380)
+    $detailsForm.BackColor = [System.Drawing.ColorTranslator]::FromHtml("#F3F6F4")
+
+    $detailsText = New-Object System.Windows.Forms.TextBox
+    $detailsText.Dock = "Fill"
+    $detailsText.Multiline = $true
+    $detailsText.ReadOnly = $true
+    $detailsText.ScrollBars = "Both"
+    $detailsText.WordWrap = $false
+    $detailsText.Font = New-Object System.Drawing.Font("Consolas", 9.5)
+    $detailsText.Text = $Details
+    $detailsForm.Controls.Add($detailsText)
+
+    [void]$detailsForm.ShowDialog($form)
 }
 
 function New-HiddenWifiProfileXml {
@@ -303,16 +439,20 @@ function Add-HiddenWifiProfile {
     }
 }
 
-function Invoke-WifiConnectRequest {
+function New-WifiConnectArguments {
     param(
         [Parameter(Mandatory = $true)]
         [string] $Name,
-        [Parameter(Mandatory = $true)]
-        [string] $Ssid,
-        [string] $InterfaceName = ""
+        [string] $Ssid = "",
+        [string] $InterfaceName = "",
+        [bool] $IncludeSsid = $false
     )
 
-    $arguments = @("wlan", "connect", "name=$Name", "ssid=$Ssid")
+    $arguments = @("wlan", "connect", "name=$Name")
+    if ($IncludeSsid -and $Ssid) {
+        $arguments += "ssid=$Ssid"
+    }
+
     if ($InterfaceName) {
         $arguments += "interface=$InterfaceName"
     }
@@ -323,10 +463,236 @@ function Invoke-WifiConnectRequest {
         }
     }
 
+    return $arguments
+}
+
+function Invoke-NativeWifiConnectRequest {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $Name,
+        [string] $Ssid = ""
+    )
+
+    if (-not ([System.Management.Automation.PSTypeName]"NativeWifiConnector").Type) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using System.Text;
+
+public static class NativeWifiConnector
+{
+    private const uint WLAN_CLIENT_VERSION = 2;
+    private const uint WLAN_CONNECTION_HIDDEN_NETWORK = 0x00000001;
+
+    private enum WLAN_CONNECTION_MODE
+    {
+        wlan_connection_mode_profile = 0
+    }
+
+    private enum DOT11_BSS_TYPE
+    {
+        dot11_BSS_type_infrastructure = 1
+    }
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private struct WLAN_CONNECTION_PARAMETERS
+    {
+        public WLAN_CONNECTION_MODE wlanConnectionMode;
+        [MarshalAs(UnmanagedType.LPWStr)]
+        public string strProfile;
+        public IntPtr pDot11Ssid;
+        public IntPtr pDesiredBssidList;
+        public DOT11_BSS_TYPE dot11BssType;
+        public uint dwFlags;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct DOT11_SSID
+    {
+        public uint uSSIDLength;
+        [MarshalAs(UnmanagedType.ByValArray, SizeConst = 32)]
+        public byte[] ucSSID;
+    }
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private struct WLAN_INTERFACE_INFO
+    {
+        public Guid InterfaceGuid;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 256)]
+        public string strInterfaceDescription;
+        public int isState;
+    }
+
+    [DllImport("wlanapi.dll")]
+    private static extern uint WlanOpenHandle(uint dwClientVersion, IntPtr pReserved, out uint pdwNegotiatedVersion, out IntPtr phClientHandle);
+
+    [DllImport("wlanapi.dll")]
+    private static extern uint WlanEnumInterfaces(IntPtr hClientHandle, IntPtr pReserved, out IntPtr ppInterfaceList);
+
+    [DllImport("wlanapi.dll")]
+    private static extern uint WlanConnect(IntPtr hClientHandle, ref Guid pInterfaceGuid, ref WLAN_CONNECTION_PARAMETERS pConnectionParameters, IntPtr pReserved);
+
+    [DllImport("wlanapi.dll")]
+    private static extern void WlanFreeMemory(IntPtr pMemory);
+
+    [DllImport("wlanapi.dll")]
+    private static extern uint WlanCloseHandle(IntPtr hClientHandle, IntPtr pReserved);
+
+    public static int Connect(string profileName, string ssid, out string message)
+    {
+        message = "";
+        IntPtr clientHandle = IntPtr.Zero;
+        IntPtr interfaceList = IntPtr.Zero;
+        IntPtr ssidPtr = IntPtr.Zero;
+
+        try
+        {
+            uint negotiatedVersion;
+            uint result = WlanOpenHandle(WLAN_CLIENT_VERSION, IntPtr.Zero, out negotiatedVersion, out clientHandle);
+            if (result != 0)
+            {
+                message = new Win32Exception((int)result).Message;
+                return (int)result;
+            }
+
+            result = WlanEnumInterfaces(clientHandle, IntPtr.Zero, out interfaceList);
+            if (result != 0)
+            {
+                message = new Win32Exception((int)result).Message;
+                return (int)result;
+            }
+
+            uint count = (uint)Marshal.ReadInt32(interfaceList, 0);
+            long itemList = interfaceList.ToInt64() + 8;
+            int itemSize = Marshal.SizeOf(typeof(WLAN_INTERFACE_INFO));
+
+            if (!String.IsNullOrEmpty(ssid))
+            {
+                byte[] ssidBytes = Encoding.UTF8.GetBytes(ssid);
+                DOT11_SSID dot11Ssid = new DOT11_SSID();
+                dot11Ssid.ucSSID = new byte[32];
+                dot11Ssid.uSSIDLength = (uint)Math.Min(ssidBytes.Length, dot11Ssid.ucSSID.Length);
+                Array.Copy(ssidBytes, dot11Ssid.ucSSID, dot11Ssid.uSSIDLength);
+                ssidPtr = Marshal.AllocHGlobal(Marshal.SizeOf(typeof(DOT11_SSID)));
+                Marshal.StructureToPtr(dot11Ssid, ssidPtr, false);
+            }
+
+            int lastResult = -1;
+            for (uint i = 0; i < count; i++)
+            {
+                IntPtr itemPtr = new IntPtr(itemList + (i * itemSize));
+                WLAN_INTERFACE_INFO wlanInterface = (WLAN_INTERFACE_INFO)Marshal.PtrToStructure(itemPtr, typeof(WLAN_INTERFACE_INFO));
+
+                WLAN_CONNECTION_PARAMETERS parameters = new WLAN_CONNECTION_PARAMETERS();
+                parameters.wlanConnectionMode = WLAN_CONNECTION_MODE.wlan_connection_mode_profile;
+                parameters.strProfile = profileName;
+                parameters.pDot11Ssid = ssidPtr;
+                parameters.pDesiredBssidList = IntPtr.Zero;
+                parameters.dot11BssType = DOT11_BSS_TYPE.dot11_BSS_type_infrastructure;
+                parameters.dwFlags = ssidPtr == IntPtr.Zero ? 0 : WLAN_CONNECTION_HIDDEN_NETWORK;
+
+                result = WlanConnect(clientHandle, ref wlanInterface.InterfaceGuid, ref parameters, IntPtr.Zero);
+                if (result == 0)
+                {
+                    message = "Native Wi-Fi connection request sent.";
+                    return 0;
+                }
+
+                lastResult = (int)result;
+            }
+
+            message = lastResult == -1 ? "No WLAN interface found." : new Win32Exception(lastResult).Message;
+            return lastResult == -1 ? 1168 : lastResult;
+        }
+        finally
+        {
+            if (ssidPtr != IntPtr.Zero)
+            {
+                Marshal.FreeHGlobal(ssidPtr);
+            }
+            if (interfaceList != IntPtr.Zero)
+            {
+                WlanFreeMemory(interfaceList);
+            }
+            if (clientHandle != IntPtr.Zero)
+            {
+                WlanCloseHandle(clientHandle, IntPtr.Zero);
+            }
+        }
+    }
+}
+'@
+    }
+
+    $message = ""
+    $code = [NativeWifiConnector]::Connect($Name, $Ssid, [ref]$message)
+    if ($code -ne 0) {
+        throw "Native Wi-Fi 发起连接 '$Name' 失败：$message"
+    }
+
+    return $message
+}
+
+function Invoke-WifiConnectRequest {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $Name,
+        [string] $Ssid = "",
+        [string] $InterfaceName = ""
+    )
+
+    $arguments = New-WifiConnectArguments -Name $Name -InterfaceName $InterfaceName
     $result = Invoke-Netsh $arguments
+    if ($result.ExitCode -ne 0 -and $Ssid -and $Ssid -ne $Name) {
+        $arguments = New-WifiConnectArguments -Name $Name -Ssid $Ssid -InterfaceName $InterfaceName -IncludeSsid $true
+        $result = Invoke-Netsh $arguments
+    }
+
+    if ($result.ExitCode -ne 0 -and $Ssid) {
+        try {
+            $alternateProfiles = @(Get-WlanProfiles | Where-Object {
+                $_.Name -ne $Name -and ($_.Ssid -eq $Ssid -or $_.Ssid -eq $Name)
+            } | Sort-Object -Property Name)
+
+            foreach ($profile in $alternateProfiles) {
+                $arguments = New-WifiConnectArguments -Name $profile.Name -InterfaceName $InterfaceName
+                $result = Invoke-Netsh $arguments
+                if ($result.ExitCode -eq 0) {
+                    return $result.Output
+                }
+
+                if ($profile.Ssid -and $profile.Ssid -ne $profile.Name) {
+                    $arguments = New-WifiConnectArguments -Name $profile.Name -Ssid $profile.Ssid -InterfaceName $InterfaceName -IncludeSsid $true
+                    $result = Invoke-Netsh $arguments
+                    if ($result.ExitCode -eq 0) {
+                        return $result.Output
+                    }
+                }
+
+                try {
+                    return (Invoke-NativeWifiConnectRequest -Name $profile.Name -Ssid $profile.Ssid)
+                }
+                catch {
+                }
+            }
+        }
+        catch {
+            # Fallback lookup is best-effort; keep the original connection error path.
+        }
+    }
 
     if ($result.ExitCode -ne 0) {
-        throw "发起连接 '$Name' 失败。可能原因：这个 Wi-Fi 当前不在可用范围内、隐藏网络未被扫描到、密码或安全类型不匹配，或保存的配置已失效。"
+        try {
+            return (Invoke-NativeWifiConnectRequest -Name $Name -Ssid $Ssid)
+        }
+        catch {
+        }
+    }
+
+    if ($result.ExitCode -ne 0) {
+        $detail = if ($result.Output) { " netsh 返回：$($result.Output)" } else { "" }
+        throw "发起连接 '$Name' 失败。可能原因：这个 Wi-Fi 当前不在可用范围内、隐藏网络未被扫描到、密码或安全类型不匹配，或保存的配置已失效。$detail"
     }
 
     return $result.Output
@@ -377,7 +743,7 @@ function Set-ActionButtonStyle {
         [System.Drawing.Color] $BackColor
     )
 
-    $Button.Width = 122
+    $Button.Width = 112
     $Button.Height = 34
     $Button.FlatStyle = "Flat"
     $Button.FlatAppearance.BorderSize = 0
@@ -454,6 +820,11 @@ $disconnectButton = New-Object System.Windows.Forms.Button
 $disconnectButton.Text = "断开"
 Set-ActionButtonStyle -Button $disconnectButton -BackColor $colorAmber
 $buttonPanel.Controls.Add($disconnectButton)
+
+$detailsButton = New-Object System.Windows.Forms.Button
+$detailsButton.Text = "详情"
+Set-ActionButtonStyle -Button $detailsButton -BackColor $colorMuted
+$buttonPanel.Controls.Add($detailsButton)
 
 $deleteButton = New-Object System.Windows.Forms.Button
 $deleteButton.Text = "删除配置"
@@ -579,12 +950,34 @@ $toolTip.ReshowDelay = 200
 $toolTip.SetToolTip($profileList, "启动时不扫描周围 Wi-Fi，只列出保存过的配置。点击刷新后会按可用/隐藏/未扫描到分组。")
 $toolTip.SetToolTip($refreshButton, "扫描当前可用 Wi-Fi，并重新按状态分组。配置较多时会比启动加载慢。")
 $toolTip.SetToolTip($connectButton, "向 Windows 发送连接请求，后台确认连接结果。")
+$toolTip.SetToolTip($detailsButton, "选中保存 Wi-Fi 时查看保存配置详情；未选中时查看当前连接详情。")
+$toolTip.SetToolTip($addHiddenButton, "添加前会自动扫描同名可见 Wi-Fi，并选择匹配的安全类型/加密方式。扫不到时保留当前选择。")
 
 function Write-Log {
     param([string] $Message)
 
     $time = Get-Date -Format "HH:mm:ss"
     $logText.AppendText("[$time] $Message`r`n")
+}
+
+function Set-HiddenWifiSecurityFromScan {
+    param([Parameter(Mandatory = $true)][string] $Ssid)
+
+    $security = Get-VisibleWifiSecurityInfo -Ssid $Ssid
+    if (-not $security) {
+        Write-Log "未扫描到 '$Ssid' 的安全类型，保留当前选择：$($authCombo.SelectedItem)/$($encCombo.SelectedItem)。"
+        return $false
+    }
+
+    if ($authCombo.Items.Contains($security.Authentication)) {
+        $authCombo.SelectedItem = $security.Authentication
+    }
+    if ($encCombo.Items.Contains($security.Encryption)) {
+        $encCombo.SelectedItem = $security.Encryption
+    }
+
+    Write-Log "已自动识别 '$Ssid'：$($security.SourceAuth)/$($security.SourceEnc) -> $($authCombo.SelectedItem)/$($encCombo.SelectedItem)。"
+    return $true
 }
 
 function New-ProfileListItem {
@@ -875,6 +1268,25 @@ $refreshButton.Add_Click({
     Refresh-Profiles
 })
 
+$detailsButton.Add_Click({
+    try {
+        $item = Get-SelectedProfileItem
+        if ($item) {
+            $name = [string]$item.Profile.Name
+            $details = Get-WifiDetailsText -Profile $item.Profile
+            Show-WifiDetailsDialog -Title "Wi-Fi 配置详情：$name" -Details $details
+            return
+        }
+
+        $details = Get-WifiDetailsText -Profile $null
+        Show-WifiDetailsDialog -Title "当前 Wi-Fi 详情" -Details $details
+    }
+    catch {
+        Write-Log $_.Exception.Message
+        [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, "Wi-Fi 切换器", "OK", "Error") | Out-Null
+    }
+})
+
 $disconnectButton.Add_Click({
     try {
         $script:PendingConnection = $null
@@ -933,6 +1345,7 @@ $addHiddenButton.Add_Click({
     }
 
     try {
+        [void](Set-HiddenWifiSecurityFromScan -Ssid $ssid)
         Write-Log "正在添加隐藏 Wi-Fi：$ssid..."
         [void](Add-HiddenWifiProfile -Ssid $ssid -Password $password -Authentication ([string]$authCombo.SelectedItem) -Encryption ([string]$encCombo.SelectedItem) -AutoConnect $autoConnectCheck.Checked)
         Write-Log "已添加/更新隐藏 Wi-Fi：$ssid"
